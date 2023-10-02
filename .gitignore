@@ -25,6 +25,9 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 
+# specialized configs
+azureml_config.yaml
+
 # PyBuilder
 target/
 
