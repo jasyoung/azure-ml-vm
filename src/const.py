@@ -1,0 +1,5 @@
+AZUREML_CONFIG_FILE = 'config/azureml_config.yaml'
+DEFAULT_WORKSPACE = 'dt-datascience-core-dev-usw2'
+DEFAULT_RESOURCE_GROUP = 'dt-datascience-core-dev-usw2'
+DEFAULT_VM_SIZE = 'Standard_DS12_v2'
+SUBSCRIPTION_ID = 'a1eab4f0-e17c-4e70-ab04-833c063dc515'
