@@ -14,6 +14,7 @@ description: "CLI for starting, stopping, sshing, and other ways of interacting 
 * cd into the repository
 * `conda env create -f env.yml`
 * `conda activate mlvm`
+* `python setup.py`
 
 
 command line options

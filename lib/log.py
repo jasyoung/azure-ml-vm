@@ -6,10 +6,11 @@ def warn(message=''):
 
 def error(message=''):
     print(f"ERROR: {message}")
+    exit(1)
 
 def usr_in(prompt=''):
-    return input(f'{prompt}')
+    return input(prompt + ' ')
 
 def yn(prompt=''):
-    usr_in = input(prompt)
+    usr_in = input(prompt + ' (y/n) ')
     return usr_in in ('y', 'yes')
