@@ -7,8 +7,10 @@ import subprocess
 import json
 from cryptography.hazmat import primitives as crypto
 import paramiko
+import git
 from src import const
 from lib import log
+from lib.conda import Conda
 from azure.core.exceptions import ResourceNotFoundError
 from azure.identity import DefaultAzureCredential, InteractiveBrowserCredential
 from azure.ai.ml import MLClient
@@ -32,29 +34,42 @@ def version():
 @click.option('--subscription-id', default=None)
 @click.option('--vm-size', default=const.DEFAULT_VM_SIZE)
 @click.option('--ssh-user', default=const.DEFAULT_SSH_USER)
-def setup(workspace, resource_group, subscription_id, vm_size):
+@click.option('--ssh-public-key-file', default=os.path.join(const.SSH_DIR,'id_rsa.pub'))
+@click.option('--ssh-private-key-file', default=os.path.join(const.SSH_DIR,'id_rsa'))
+def setup(workspace, resource_group, subscription_id, vm_size, ssh_user, ssh_public_key_file, ssh_private_key_file):
     resource_group, subscription_id = set_ml_env_vars(resource_group, subscription_id)
-
     # configure_azure_credentials()
     ml_client = get_ml_client({'workspace_name': workspace, 'resource_group': resource_group, 'subscription_id': subscription_id})
     vm_linked = link_vm(ml_client, vm_size) # returns a ComputeInstance object, else returns False
     if not vm_linked:
         log.error("Didn't link VM. Setup aborted.")
-    setup_ssh(ml_client, vm_linked, ssh_user)
-    setup_cli()
+    setup_ssh(ml_client, vm_linked, ssh_user, ssh_public_key_file, ssh_private_key_file)
+    setup_cli(const.EXE_NAME) # create the cli executable add it to PATH
+    setup_sf_connection()
+
+@click.command(help="Pull the latest mlvm version, update the conda env, and generate new executable")
+def update():
+    git.cmd.Git(os.path.dirname(__file__)).pull()
+    Conda().update_env()
+    setup_cli(const.EXE_NAME)
 
 @click.command(help='Start up your Azure ML VM')
 @click.option('-w', '--wait', default=False, help='Wait for the VM to become available')
 def start(wait):
-    azureml_configs = json.load(open(const.AZUREML_CONFIG_FILE))
-    vm = ComputeInstance(get_ws(), azureml_configs['vm_name'])
-    vm.start(wait_for_completion=wait)
+    azureml_config = load_azureml_config()
+    ml_client = get_ml_client(azureml_config)
+    poller = ml_client.compute.begin_start(azureml_config['vm_name'])
+    if wait:
+        poller.wait()
 
 @click.command(help='Shut down your Azure ML VM')
-def stop():
-    azureml_configs = yaml.load(open(const.AZUREML_CONFIG_FILE))
-    vm = ComputeInstance(get_ws(azureml_configs), azureml_configs['vm_name'])
-    vm.stop()
+@click.option('-w', '--wait', default=False, help='Wait for the VM to shut down')
+def stop(wait):
+    azureml_config = load_azureml_config()
+    ml_client = get_ml_client(azureml_config)
+    poller = ml_client.compute.begin_stop(azureml_config['vm_name'])
+    if wait:
+        poller.wait()
 
 @click.command(help='SSH into your Azure ML VM')
 def ssh():
@@ -137,7 +152,7 @@ def provision_vm(ml_client, vm_name, vm_size):
         log.info(f'Provisioning VM {vm_name}. This may take a few minutes.')
         my_vm = ComputeInstance(name=vm_name, size=vm_size, ssh_public_access_enabled=True,
                                 idle_time_before_shutdown_minutes=60, setup_scripts=None, enable_node_public_ip=True)
-        my_vm = ml_client.compute.begin_create_or_update(my_vm)
+        my_vm = ml_client.compute.begin_create_or_update(my_vm).result()
         return my_vm
 
 def add_item_to_azureml_config(key, value):
@@ -151,17 +166,36 @@ def load_azureml_config():
     with open(const.AZUREML_CONFIG_FILE, 'r') as azureml_config:
         return json.load(azureml_config)
 
-def setup_ssh(ml_client, compute_instance, ssh_user):
-    generate_ssh_keypair()
+def setup_ssh(ml_client, compute_instance, ssh_user, public_key_file, private_key_file):
+    # save new/existing ssh key file paths in azureml_config
+    link_ssh_keypair(public_key_file, private_key_file)
+
     # update the compute instance with ssh settings
     public_key = load_public_ssh_key()
     ssh_settings = ComputeInstanceSshSettings(public_key, ssh_port=50001)
     compute_instance.ssh_settings = ssh_settings
-    compute_instance = ml_client.compute.begin_create_or_update(compute_instance)
+    compute_instance = ml_client.compute.begin_create_or_update(compute_instance).result()
     add_item_to_azureml_config('vm_public_ip', compute_instance.network_settings.public_ip_address)
     add_item_to_azureml_config('ssh_user', ssh_user)
 
-def generate_ssh_keypair():
+def link_ssh_keypair(public_key_file, private_key_file):
+    if not os.path.isfile(public_key_file):
+        log.warn(f'Could not find existing public key file {public_key_file}.')
+        if log.yn(f'Generate new ssh keypair with private key at {private_key_file} and public key at {public_key_file}?'):
+            # generate a new ssh keypair if we don't have one
+            # Assumes we don't have one if the specified public_key_file doesn't exist
+            generate_ssh_keypair(private_key_file, public_key_file)
+        else:
+            log.error("""Did not link ssh keypair. To link an ssh keypair, 
+                      please specify the file locations for existing ones, use the default locations, or generate new keys.
+                      You can specify specific key locations with the --ssh-public-key-file and --ssh-private-key-file options.
+                      Aborting.""")
+    else: # assumes we already have an ssh keypair
+        # so we just need to note them in the azureml config
+        add_item_to_azureml_config('private_ssh_key_file', private_key_file)
+        add_item_to_azureml_config('public_ssh_key_file', public_key_file)
+
+def generate_ssh_keypair(private_key_file, public_key_file):
     private_key = crypto.asymmetric.rsa.generate_private_key(
         public_exponent=65537,
         key_size=2048
@@ -169,25 +203,25 @@ def generate_ssh_keypair():
     public_key = private_key.public_key()
     if not os.path.exists(const.SSH_DIR):
         os.makedirs(const.SSH_DIR)
-    save_private_ssh_key(private_key)
-    save_public_ssh_key(public_key)
+    save_private_ssh_key(private_key, private_key_file)
+    save_public_ssh_key(public_key, public_key_file)
 
-def save_private_ssh_key(private_key):
+def save_private_ssh_key(private_key, private_key_file):
     private_pem = private_key.private_bytes(
         encoding=crypto.serialization.Encoding.PEM,
         format=crypto.serialization.PrivateFormat.PKCS8,
         encryption_algorithm=crypto.serialization.NoEncryption()
     )
-    file_loc = add_item_to_azureml_config('private_ssh_key_file', f'{const.SSH_DIR}/id_rsa')
+    file_loc = add_item_to_azureml_config('private_ssh_key_file', private_key_file)
     with open(file_loc, 'wb') as f:
         f.write(private_pem)
 
-def save_public_ssh_key(public_key):
+def save_public_ssh_key(public_key, public_key_file):
     public_pem = public_key.public_bytes(
         encoding=crypto.serialization.Encoding.PEM,
         format=crypto.serialization.PublicFormat.SubjectPublicKeyInfo
     )
-    file_loc = add_item_to_azureml_config('public_ssh_key_file', f'{const.SSH_DIR}/id_rsa.pub')
+    file_loc = add_item_to_azureml_config('public_ssh_key_file', public_key_file)
     with open(file_loc, 'wb') as f:
         f.write(public_pem)
 
@@ -197,9 +231,25 @@ def load_public_ssh_key():
         return crypto.serialization.load_pem_public_key(
             key_file.read()
         )
+    
+def setup_cli(exe_name):
+    PyInstaller.__main__.run(['main.py', '--clean', '--name', exe_name]) # generate the executable
+    # path to the newly generated executable (src)
+    path_to_exe = os.path.join(os.path.dirname(__file__), 'dist', exe_name, exe_name)
+    if os.name == 'nt': # Windows
+        path_to_exe += '.exe'
+    # path to the soft link (dst)
+    linked_file = select_loc_for_linked_file(exe_name)
+    # Assuming the linked file is in your PATH, this cli will be callable as mlvm
+    os.symlink(path_to_exe, linked_file)
 
-def setup_cli():
-    pass
+def select_loc_for_linked_file(exe_name):
+    # select the env dir that contains the exe_name, which is assumed to be the same as the env_name
+    env_dirs = json.loads(subprocess.check_output('conda env list -v --json'.split(' '), text=True))
+    for env_dir in env_dirs['envs']:
+        if env_dir.endswith(exe_name):
+            return os.path.join(env_dir, exe_name)
+    log.error('Could not find conda env mlvm. Please find the mlvm executable and link it to your PATH manually.')
 
 def setup_sf_connection():
     pass
