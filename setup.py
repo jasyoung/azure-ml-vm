@@ -1,12 +1,10 @@
 #!/usr/bin/env python
 
 import sys
+import os
 from lib.conda import Conda
-from main import main
 
 # setup conda env
+# we have to have our env set up before we import anything else
 Conda().setup()
-
-# make sure we run main.py with the first argument of 'setup'
-sys.argv.insert(1, 'setup')
-main()
+os.system('conda run --no-capture-output -n mlvm python main.py setup ' + ' '.join(sys.argv[1:])) # sys.argv[0] is setup.py
