@@ -14,7 +14,7 @@ def disp_message(level, message, verbose):
 
     if not verbose:
         print(statement)
-    elif is_verbose: # if we are in verbose mode
+    elif is_verbose(): # if we are in verbose mode
         print(f'V {statement}')
     # else, it requires verbose mode to print but we're not in verbose mode
 

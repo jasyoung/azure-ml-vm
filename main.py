@@ -1,14 +1,8 @@
 #!/usr/bin/env python
 
-import click
-import re
-import string
-import os
-import subprocess
-import json
+import click, re, string, os, shutil, socket, subprocess, json, paramiko, git
 from cryptography.hazmat import primitives as crypto
-import paramiko
-import git
+import PyInstaller.__main__
 from src import const
 from lib import log
 from lib.conda import Conda
@@ -18,19 +12,21 @@ from azure.ai.ml import MLClient
 from azure.ai.ml.entities import ComputeInstance, ComputeInstanceSshSettings
 
 @click.group()
-def cli():
+@click.option('-v', '--verbose', default=False, help='Show detailed messaging')
+@click.option('--debug', default=False, help='Show debug messages')
+def cli(verbose, debug):
     pass
 
 ## CLI COMMANDS
 
-@cli.command(help='Display the current version of this CLI',
+@click.command(name='--version', help='Display the current version of this CLI',
              context_settings={'ignore_unknown_options': True, 'allow_extra_args': True})
 def version():
     changelog_txt = open("CHANGELOG.md").read()
     version = re.findall(r"\[\d.*\].*", changelog_txt)[0]
     click.echo(f"Azure ML VM CLI version {version}")
 
-@cli.command(help="Create/Link your VM and set up this CLI to your path",
+@cli.command(name='setup', help="Create/Link your VM and set up this CLI to your path",
              context_settings={'ignore_unknown_options': True, 'allow_extra_args': True})
 @click.option('--workspace', default=const.DEFAULT_WORKSPACE)
 @click.option('--resource-group', default=const.DEFAULT_RESOURCE_GROUP)
@@ -40,23 +36,49 @@ def version():
 @click.option('--ssh-user', default=const.DEFAULT_SSH_USER)
 @click.option('--ssh-public-key-file', default=os.path.join(const.SSH_DIR,'id_rsa.pub'))
 @click.option('--ssh-private-key-file', default=os.path.join(const.SSH_DIR,'id_rsa'))
+def setup_command(workspace, resource_group, subscription_id, vm_name, vm_size, ssh_user, ssh_public_key_file, ssh_private_key_file):
+    return setup(workspace, resource_group, subscription_id, vm_name, vm_size, ssh_user, ssh_public_key_file, ssh_private_key_file)
+
+@cli.command(name='update', help="Pull the latest mlvm version, update the conda env, and generate new executable",
+             context_settings={'ignore_unknown_options': True, 'allow_extra_args': True})
+def update_command():
+    return update()
+
+@cli.command(name='start', help='Start up your Azure ML VM',
+             context_settings={'ignore_unknown_options': True, 'allow_extra_args': True})
+@click.option('-w', '--wait', default=False, help='Wait for the VM to become available')
+def start_command(wait):
+    return start(wait)
+
+@cli.command(name='stop', help='Shut down your Azure ML VM',
+             context_settings={'ignore_unknown_options': True, 'allow_extra_args': True})
+@click.option('-w', '--wait', default=False, help='Wait for the VM to shut down')
+def stop_command(wait):
+    return stop(wait)
+
+@cli.command(name='ssh', help='SSH into your Azure ML VM',
+             context_settings={'ignore_unknown_options': True, 'allow_extra_args': True})
+def ssh_command():
+    return ssh()
+
+
+## COMMAND IMPLEMENTATIONS
+
 def setup(workspace, resource_group, subscription_id, vm_name, vm_size, ssh_user, ssh_public_key_file, ssh_private_key_file):
     if not vm_name is None and not validate_vm_name(vm_name):
         log.error("Invalid vm name. Must be between 2-16 chars and contain only letters, numbers, or -")
     if not vm_size is None and not validate_vm_size(vm_size):
         log.error(f"Invalid vm size. It must be one of {const.VALID_VM_SIZES}")
     resource_group, subscription_id = set_ml_env_vars(resource_group, subscription_id)
-    # configure_azure_credentials()
+    create_config_file_if_not_exists()
+    ssh_settings = setup_ssh(ssh_user, ssh_public_key_file, ssh_private_key_file)
     ml_client = get_ml_client({'workspace_name': workspace, 'resource_group': resource_group, 'subscription_id': subscription_id})
-    vm_linked = link_vm(ml_client, vm_name, vm_size) # returns a ComputeInstance object, else returns False
+    vm_linked = link_vm(ml_client, vm_name, vm_size, ssh_settings) # returns a ComputeInstance object, else returns False
     if not vm_linked:
         log.error("Didn't link VM. Setup aborted.")
-    setup_ssh(ml_client, vm_linked, ssh_user, ssh_public_key_file, ssh_private_key_file)
     setup_cli(const.EXE_NAME) # create the cli executable add it to PATH
     setup_sf_connection()
 
-@cli.command(help="Pull the latest mlvm version, update the conda env, and generate new executable",
-             context_settings={'ignore_unknown_options': True, 'allow_extra_args': True})
 def update():
     log.info("Pulling latest version of mlvm from git")
     git.cmd.Git(os.path.dirname(__file__)).pull()
@@ -64,9 +86,6 @@ def update():
     Conda().update_env()
     setup_cli(const.EXE_NAME)
 
-@cli.command(help='Start up your Azure ML VM',
-             context_settings={'ignore_unknown_options': True, 'allow_extra_args': True})
-@click.option('-w', '--wait', default=False, help='Wait for the VM to become available')
 def start(wait):
     azureml_config = load_azureml_config()
     ml_client = get_ml_client(azureml_config)
@@ -75,9 +94,6 @@ def start(wait):
         log.info("Waiting for compute instance to start", verbose=True)
         poller.wait()
 
-@cli.command(help='Shut down your Azure ML VM',
-             context_settings={'ignore_unknown_options': True, 'allow_extra_args': True})
-@click.option('-w', '--wait', default=False, help='Wait for the VM to shut down')
 def stop(wait):
     azureml_config = load_azureml_config()
     ml_client = get_ml_client(azureml_config)
@@ -85,17 +101,34 @@ def stop(wait):
     if wait:
         poller.wait()
 
-@cli.command(help='SSH into your Azure ML VM',
-             context_settings={'ignore_unknown_options': True, 'allow_extra_args': True})
 def ssh():
     azureml_config = load_azureml_config()
     log.info("Starting ssh client", verbose=True)
     ssh_client = paramiko.SSHClient()
-    log.info("Looking for ssh keys", verbose=True)
-    ssh_client.look_for_keys(True)
+    ssh_client.load_host_keys(const.SSH_KNOWN_HOSTS)
     log.info(f"Connecting to {azureml_config['ssh_user']}@{azureml_config['vm_public_ip']}:{const.SSH_PORT}", verbose=True)
-    ssh_client.connect(azureml_config['vm_public_ip'], port=const.SH_PORT, username=azureml_config['ssh_user'])
-    ssh_client.close()
+    try:
+        # this is just to make sure we can connect. It's very difficult for paramiko to open an interactive shell session
+        ssh_client.connect(azureml_config['vm_public_ip'], port=const.SSH_PORT, username=azureml_config['ssh_user'], 
+                           key_filename=azureml_config['private_ssh_key_file'], timeout=4)
+        ssh_client.close()
+        log.info("Connected! Invoking shell", verbose=True)
+        os.system(f"ssh -i {azureml_config['private_ssh_key_file']} {azureml_config['ssh_user']}@{azureml_config['vm_public_ip']} -p {const.SSH_PORT}")
+    except socket.timeout:
+        log.warn(f"SSH connection to {azureml_config['vm_public_ip']} timed out.")
+        ml_client = get_ml_client(azureml_config=azureml_config)
+        if not vm_running(ml_client, azureml_config=azureml_config):
+            log.warn(f"VM {azureml_config['vm_name']} is not running.")
+            if log.yn("Start it up?"):
+                start(True)
+                ssh()
+            else:
+                log.info(f"Aborted.")
+    except Exception as ex:
+        log.error(f"""{ex}
+                  Could not connect via SSH.
+                  Check your ssh-public-key and the VM's ssh settings in the Azure portal.
+                  Azure ML Compute portal: {get_ml_computes_url()}""")
 
 
 ## NON COMMANDS
@@ -132,22 +165,19 @@ def get_env_var(env_var, default):
         log.info(f"{env_var} not found. Using {default}", verbose=True)
         return default
 
+def create_config_file_if_not_exists():
+    if not os.path.isfile(const.AZUREML_CONFIG_FILE):
+        log.warn(f"{const.AZUREML_CONFIG_FILE} file not found. Generating one.", verbose=True)
+        with open(const.AZUREML_CONFIG_FILE, "w") as fo:
+            fo.write(json.dumps({}))
+
 # azureml_config should be a dict with keys workspace_name, resource_group, and subscription_id
 def get_ml_client(azureml_config=None):
     log.info("Getting ML Client", verbose=True)
     if azureml_config is None:
         azureml_config = load_azureml_config()
     credential = authenticate()
-    try:
-        ml_client = MLClient.from_config(credential=credential)
-    except Exception as ex:
-        log.warn("Config file not found. Generating one.", verbose=True)
-        config_path = const.AZUREML_CONFIG_FILE
-        with open(config_path, "w") as fo:
-            fo.write(json.dumps(azureml_config))
-        ml_client = MLClient.from_config(credential=credential, path=config_path)
-
-    return ml_client
+    return MLClient.from_config(credential=credential, path=const.AZUREML_CONFIG_FILE)
 
 def authenticate():
     log.info("Authenticating...")
@@ -162,7 +192,7 @@ def authenticate():
         credential = InteractiveBrowserCredential()
     return credential
 
-def link_vm(ml_client, vm_name, vm_size):
+def link_vm(ml_client, vm_name, vm_size, ssh_settings):
     log.info("Linking vm", verbose=True)
     if vm_name is None:
         try: # look for vm_name in the configs
@@ -171,11 +201,13 @@ def link_vm(ml_client, vm_name, vm_size):
                 vm_name = enter_vm_name()
         except KeyError:
             vm_name = enter_vm_name()
-    vm_provisioned = provision_vm(ml_client, vm_name, vm_size) # provision vm if doesn't exist
+    vm_provisioned = provision_vm(ml_client, vm_name, vm_size, ssh_settings) # provision vm if doesn't exist
     if not vm_provisioned:
         log.warn("Did not provision VM")
         return False
     add_item_to_azureml_config('vm_name', vm_name)
+    add_item_to_azureml_config('vm_public_ip', vm_provisioned.network_settings.public_ip_address)
+    add_to_known_hosts(vm_provisioned.network_settings.public_ip_address)
     return vm_provisioned # returns a ComputeInstance object, else returns False
 
 def enter_vm_name():
@@ -186,7 +218,7 @@ def enter_vm_name():
             continue
         return vm_name
 
-def provision_vm(ml_client, vm_name, vm_size):
+def provision_vm(ml_client, vm_name, vm_size, ssh_settings):
     try:
         my_vm = ml_client.compute.get(vm_name)
         log.info(f'Found existing VM {vm_name} in {ml_client.workspace_name}')
@@ -201,10 +233,19 @@ def provision_vm(ml_client, vm_name, vm_size):
         if not yn:
             return False
         log.info(f'Provisioning VM {vm_name}. This may take a few minutes.')
-        my_vm = ComputeInstance(name=vm_name, size=vm_size, ssh_public_access_enabled=True,
+        my_vm = ComputeInstance(name=vm_name, size=vm_size, ssh_public_access_enabled=True, ssh_settings=ssh_settings,
                                 idle_time_before_shutdown_minutes=60, setup_scripts=None, enable_node_public_ip=True)
         my_vm = ml_client.compute.begin_create_or_update(my_vm).result()
         return my_vm
+
+def add_to_known_hosts(public_ip):
+    transport = paramiko.Transport(public_ip)
+    transport.connect()
+    key = transport.get_remote_server_key()
+    transport.close()
+    hostfile = paramiko.HostKeys(filename=const.SSH_KNOWN_HOSTS)
+    hostfile.add(hostname=public_ip, key=key, keytype=key.get_name())
+    hostfile.save(filename=const.SSH_KNOWN_HOSTS)
 
 def add_item_to_azureml_config(key, value):
     log.info(f"Adding {key}: {value} to {const.AZUREML_CONFIG_FILE}", verbose=True)
@@ -216,24 +257,20 @@ def add_item_to_azureml_config(key, value):
 
 def load_azureml_config():
     log.info(f"Loading {const.AZUREML_CONFIG_FILE}", verbose=True)
-    with open(const.AZUREML_CONFIG_FILE, 'r') as azureml_config:
-        return json.load(azureml_config)
+    try:
+        with open(const.AZUREML_CONFIG_FILE, 'r') as azureml_config:
+            return json.load(azureml_config)
+    except FileNotFoundError:
+        log.error(f"{const.AZUREML_CONFIG_FILE} not found. Please run `mlvm setup` to create it.")
 
-def setup_ssh(ml_client, compute_instance, ssh_user, public_key_file, private_key_file):
+def setup_ssh(ssh_user, public_key_file, private_key_file):
     log.info("Setting up SSH", verbose=True)
     # save new/existing ssh key file paths in azureml_config
     log.info("Saving the new SSH key file paths in azureml_config")
     link_ssh_keypair(public_key_file, private_key_file)
-
-    # update the compute instance with ssh settings
-    log.info("Updating the SSH settings for the compute instance")
-    ssh_settings = ComputeInstanceSshSettings(ssh_public_access='Enabled', admin_public_key=public_key_file,
-                                              admin_user_name=ssh_user, ssh_port=const.SSH_PORT)
-    compute_instance.ssh_settings = ssh_settings
-    log.info(f"network_settings: {compute_instance.network_settings}")
-    compute_instance = ml_client.compute.begin_update(compute_instance).result()
-    add_item_to_azureml_config('vm_public_ip', compute_instance.network_settings.public_ip_address)
     add_item_to_azureml_config('ssh_user', ssh_user)
+    return ComputeInstanceSshSettings(ssh_public_access='Enabled', admin_public_key=public_key_file,
+                                      admin_user_name=ssh_user, ssh_port=const.SSH_PORT)
 
 def link_ssh_keypair(public_key_file, private_key_file):
     if not os.path.isfile(public_key_file):
@@ -284,9 +321,41 @@ def save_public_ssh_key(public_key, public_key_file):
     with open(file_loc, 'wb') as f:
         f.write(public_pem)
 
+def load_public_ssh_key():
+    log.info("Loading public ssh key", verbose=True)
+    public_key_file = load_azureml_config()['public_ssh_key_file']
+    with open(public_key_file, 'rb') as key_file:
+        try:
+            return crypto.serialization.load_pem_public_key(
+                key_file.read()
+            )
+        except ValueError as ex:
+            log.error(f"""{ex} Your key needs to be in the PEM format. 
+                      Please look up how to encode it as such (recommended) or generate new ssh keys.""")
+
+def vm_running(ml_client, azureml_config=None):
+    if azureml_config is None:
+        azureml_config = load_azureml_config()
+    return 'running' == ml_client.compute.get(azureml_config['vm_name']).state
+
+def get_ml_computes_url(azureml_config=None):
+    if azureml_config is None:
+        azureml_config = load_azureml_config()
+    url = 'https://ml.azure.com/compute/list/instances?wsid=/subscriptions/'
+    url += azureml_config['subscription_id'] + '/resourceGroups/'
+    url += azureml_config['resource_group'] + '/providers/Microsoft.MachineLearningServices/workspaces/'
+    url += azureml_config['workspace_name'] + '&tid=1aff0669-ee5f-40b8-9800-b5ec4f39c48e'
+    return url
+
 def setup_cli(exe_name):
     log.info("Generating the cli executable", verbose=True)
-    PyInstaller.__main__.run(['main.py', '--clean', '--name', exe_name]) # generate the executable
+    try:
+        PyInstaller.__main__.run(['main.py', '--clean', '--name', exe_name]) # generate the executable
+    except PyInstaller.isolated._parent.SubprocessDiedError:
+        # something weird happened. Just delete everything in build/mlvm and dist/mlvm first
+        shutil.rmtree(os.path.join('build', 'mlvm'))
+        shutil.rmtree(os.path.join('dist', 'mlvm'))
+        PyInstaller.__main__.run(['main.py', '--clean', '--name', exe_name]) # generate the executable
     # path to the newly generated executable (src)
     path_to_exe = os.path.join(os.path.dirname(__file__), 'dist', exe_name, exe_name)
     if os.name == 'nt': # Windows
@@ -297,8 +366,13 @@ def setup_cli(exe_name):
     log.info(f"Path to the soft link: {linked_file}", verbose=True)
     # Assuming the linked file is in your PATH, this cli will be callable as mlvm
     log.info('Linking files', verbose=True)
-    os.symlink(path_to_exe, linked_file)
-    log.info("Assuming the linked file is in your PATH, this cli will be callable as mlvm", verbose=True)
+    try:
+        os.symlink(path_to_exe, linked_file)
+    except FileExistsError:
+        log.warn(f"{linked_file} already exists. Relinking.", verbose=True)
+        os.remove(linked_file)
+        os.symlink(path_to_exe, linked_file)
+    log.info("Assuming the linked file is in your PATH, this cli will be callable as mlvm")
 
 def select_loc_for_linked_file(exe_name):
     log.info("Finding a location for the linked file", verbose=True)
@@ -313,36 +387,15 @@ def setup_sf_connection():
     log.warn("Snowflake Connection setup has not been implemented yet.", verbose=True)
     pass
 
-# We shouldn't need to use this since it should be taken care of
-# If it turns out we don't need it, remove azure-cli dependency
-def ensure_logged_in():
-    if 0 != subprocess.check_call('az login --use-device-code'.split(' ')):
-        log.error("Couldn't log in to Azure")
-
-# We shouldn't need to use this since ComputeInstanceSshSettings() only requires a public key file
-# If it turns out we do need it, the call should go right before ComputeInstanceSshSettings() above
-def load_public_ssh_key():
-    log.info("Loading public ssh key", verbose=True)
-    public_key_file = load_azureml_config()['public_ssh_key_file']
-    with open(public_key_file, 'rb') as key_file:
-        try:
-            return crypto.serialization.load_pem_public_key(
-                key_file.read()
-            )
-        except ValueError as ex:
-            log.error(f"""{ex} Your key needs to be in the PEM format. 
-                      Please look up how to encode it as such (recommended) or generate new ssh keys.""")
-
 ## ADD COMMANDS TO THE CLI
 def main():
     cli.add_command(version)
-    cli.add_command(setup)
-    cli.add_command(start)
-    cli.add_command(stop)
-    cli.add_command(ssh)
+    cli.add_command(setup_command)
+    cli.add_command(start_command)
+    cli.add_command(stop_command)
+    cli.add_command(ssh_command)
 
     cli()
-    # cli(log.is_verbose(), log.is_debug())
 
 if __name__ == '__main__':
     main()
