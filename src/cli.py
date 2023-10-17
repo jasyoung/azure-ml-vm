@@ -1,38 +1,63 @@
 import os, re
+from docopt import docopt
 from src.mlvm import Mlvm
 from src import const
 
-class Cli():
-    def __init__(self):
-        self.mlvm = Mlvm()
+def version():
+    changelog_txt = open("CHANGELOG.md").read()
+    version = re.findall(r"\[\d.*\].*", changelog_txt)[0]
+    return f"Azure ML VM CLI version {version}"
 
-    # help='Display the current version of this CLI'
-    def version(self):
-        changelog_txt = open("CHANGELOG.md").read()
-        version = re.findall(r"\[\d.*\].*", changelog_txt)[0]
-        print(f"Azure ML VM CLI version {version}")
+def default_arg_str(arg, mlvm):
+    config_arg = mlvm.azureml_config.get(arg)
+    if config_arg:
+        return f" [default: {config_arg}]"
+    return f" If not set, you will be prompted to enter a {re.sub('_', ' ', arg)}."
 
-    # help="Create/Link your VM and set up this CLI to your path"
-    # '--vm-name', help="If not set, you will be prompted to enter a vm name. Recommended format: ds-vm-<yourname>"
-    def setup(self, workspace=const.DEFAULT_WORKSPACE, resource_group=const.DEFAULT_RESOURCE_GROUP, subscription_id=const.DEFAULT_SUBSCRIPTION_ID,
-              vm_name=None, vm_size=const.DEFAULT_VM_SIZE, ssh_user=const.DEFAULT_SSH_USER,
-              ssh_public_key_file=os.path.join(const.SSH_DIR,'id_rsa.pub'), ssh_private_key_file=os.path.join(const.SSH_DIR,'id_rsa')):
-        return self.mlvm.setup(workspace, resource_group, subscription_id, vm_name, vm_size, ssh_user, ssh_public_key_file, ssh_private_key_file)
 
-    # help="Pull the latest mlvm version, update the conda env, and generate new executable"
-    def update(self):
-        return self.mlvm.update()
+mlvm = Mlvm()
 
-    # help='Start up your Azure ML VM'
-    # '-w', '--wait', help='Wait for the VM to become available')
-    def start(self, wait=False):
-        return self.mlvm.start(wait)
+# Help message per doctopt requirements
+msg = f"""Azure ML VM CLI
 
-    # name='stop', help='Shut down your Azure ML VM'
-    # '-w', '--wait', help='Wait for the VM to shut down')
-    def stop(self, wait=False):
-        return self.mlvm.stop(wait)
+Usage:
+    mlvm setup [--workspace WORKSPACE_NAME] [--resource-group RESOURCE_GROUP] [--subscription-id SUBSCRIPTION_ID]
+               [--vm-name VM_NAME] [--vm-size VM_SIZE] [--ssh-user SSH_USER] [--ssh-public-key-file FILE_PATH]
+               [--ssh-private-key-file FILE_PATH] [--verbose]
+    mlvm update [--verbose]
+    mlvm start [(-w, --wait)] [--verbose]
+    mlvm stop [(-w, --wait)] [--verbose]
+    mlvm ssh [--verbose]
+    mlvm (-h | --help)
+    mlvm --version
 
-    # help='SSH into your Azure ML VM'
-    def ssh(self):
-        return self.mlvm.ssh()
+Options:
+    -h --help                         Show this screen
+    --version                         Display the current version of this CLI
+    --verbose                         Show more text
+    --workspace WORKSPACE_NAME        Name of your Azure ML workspace [default: {mlvm.azureml_config.get('workspace') or const.DEFAULT_WORKSPACE}]
+    --resource-group RESOURCE_GROUP   Name of your Azure ML resource group [default: {mlvm.azureml_config.get('resource_group') or const.DEFAULT_RESOURCE_GROUP}]
+    --subscription-id SUBSCRIPTION_ID Your Azure ML subscription ID [default: {mlvm.azureml_config.get('subscription_id') or const.DEFAULT_SUBSCRIPTION_ID}]
+    --vm-name VM_NAME                 Recommended format: ds-vm-<yourname>{default_arg_str('vm_name', mlvm)}
+    --vm-size VM_SIZE                 Size/Type of your Azure ML Compute Instance [default: {mlvm.azureml_config.get('vm_size') or const.DEFAULT_VM_SIZE}]
+    --ssh-user SSH_USER               Admin username for the Compute Instance [default: {mlvm.azureml_config.get('ssh_user') or const.DEFAULT_SSH_USER}]
+    --ssh-public-key-file FILE_PATH   Path to your SSH public key file [default: {mlvm.azureml_config.get('ssh_public_key_file') or os.path.join(const.SSH_DIR,'id_rsa.pub')}
+    --ssh-private-key-file FILE_PATH  Path to your SSH private key file [default: {mlvm.azureml_config.get('ssh_private_key_file') or os.path.join(const.SSH_DIR,'id_rsa')}]
+    -w --wait                         Wait for the request (stop/start Compute Instance) to be completed
+"""
+
+args = docopt(msg, version=version())
+args['--wait'] = bool(args) # docopt sets these to 0 or 1, needs to be bool
+
+if args['setup']:
+    mlvm.setup(args['--workspace'], args['--resource-group'], args['--subscription-id'],
+               args['--vm-name'], args['--vm-size'], args['--ssh-user'],
+               args['--ssh-public-key-file'], args['--ssh-private-key-file'])
+elif args['update']:
+    mlvm.update()
+elif args['start']:
+    mlvm.start(args['--wait'])
+elif args['stop']:
+    mlvm.stop(args['--wait'])
+elif args['ssh']:
+    mlvm.ssh()

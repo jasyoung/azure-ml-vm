@@ -22,13 +22,14 @@ class Mlvm():
     ## COMMAND IMPLEMENTATIONS
 
     def setup(self, workspace, resource_group, subscription_id, vm_name, vm_size, ssh_user, ssh_public_key_file, ssh_private_key_file):
+        log.info(f'got args {workspace, resource_group, subscription_id, vm_name, vm_size, ssh_user, ssh_public_key_file, ssh_private_key_file}', verbose=True)
         # validate the vm name and vm size
         if not vm_name is None and not __class__.validate_vm_name(vm_name):
             log.error("Invalid vm name. Must be between 2-16 chars and contain only letters, numbers, or -")
         if not __class__.validate_vm_size(vm_size): # vm_size should not be None. It has a default.
             log.error(f"Invalid vm size. It must be one of {const.VALID_VM_SIZES}")
         # populate the azureml config with the supplied arguments
-        self.initialize_azureml_config(self, workspace, resource_group, subscription_id, vm_name, vm_size, ssh_user, ssh_public_key_file, ssh_private_key_file)
+        self.initialize_azureml_config(workspace, resource_group, subscription_id, vm_name, vm_size, ssh_user, ssh_public_key_file, ssh_private_key_file)
 
         self.set_ml_client()
         ssh_settings = self.setup_ssh()
@@ -69,10 +70,10 @@ class Mlvm():
         try:
             # this is just to make sure we can connect. It's very difficult for paramiko to open an interactive shell session
             ssh_client.connect(self.azureml_config['vm_public_ip'], port=const.SSH_PORT, username=self.azureml_config['ssh_user'], 
-                            key_filename=self.azureml_config['private_ssh_key_file'], timeout=4)
+                            key_filename=self.azureml_config['ssh_private_key_file'], timeout=4)
             ssh_client.close()
             log.info("Connected! Invoking shell", verbose=True)
-            os.system(f"ssh -i {self.azureml_config['private_ssh_key_file']} {self.azureml_config['ssh_user']}@{self.azureml_config['vm_public_ip']} -p {self.const.SSH_PORT}")
+            os.system(f"ssh -i {self.azureml_config['ssh_private_key_file']} {self.azureml_config['ssh_user']}@{self.azureml_config['vm_public_ip']} -p {self.const.SSH_PORT}")
         except socket.timeout:
             log.warn(f"SSH connection to {self.azureml_config['vm_public_ip']} timed out.")
             self.set_ml_client()
@@ -116,15 +117,6 @@ class Mlvm():
             log.warn(f"{const.AZUREML_CONFIG_FILE} file not found. Generating one.", verbose=True)
             with open(const.AZUREML_CONFIG_FILE, "w") as fo:
                 fo.write(json.dumps({}))
-
-    @staticmethod
-    def get_env_var(env_var, default):
-        log.info(f"Looking for environment variable {env_var}", verbose=True)
-        try:
-            return os.environ[env_var]
-        except KeyError:
-            log.info(f"{env_var} not found. Using {default}", verbose=True)
-            return default
 
     @staticmethod
     def enter_vm_name():
@@ -201,9 +193,9 @@ class Mlvm():
 
     # this ensures that self and the config file match. Use this when adding/updating config attributes
     def add_item_to_azureml_config(self, key, value, allow_none=False, prompt_overwrite=False):
+        log.info(f"Adding {key}: {value} to {const.AZUREML_CONFIG_FILE}", verbose=True)
         if not allow_none and value is None:
             log.error(f"Can't accept value of None for {key}")
-        self.azureml_config = __class__.load_azureml_config()
         existing_value = self.azureml_config.get(key)
         # see if the user wants to overwrite a new value into their config
         # only necessary if the existing value is not none; !still necessary if the new value is None!
@@ -213,23 +205,15 @@ class Mlvm():
                 return existing_value
         elif existing_value == value: # If they're already the same then who cares
             return value
-        log.info(f"Adding {key}: {value} to {const.AZUREML_CONFIG_FILE}", verbose=True)
         self.azureml_config[key] = value
         with open(const.AZUREML_CONFIG_FILE, 'w') as file:
             file.write(json.dumps(self.azureml_config))
         return value
 
-    # try to use the passed var first
-    # if that's not set then try the os.environ
-    # else use the value in const.py and set to os.environ
-    def set_ml_env_vars(self, resource_group, subscription_id):
-        if resource_group is None:
-            self.add_item_to_azureml_config('resource_group', __class__.get_env_var('RESOURCE_GROUP_NAME', const.DEFAULT_RESOURCE_GROUP), prompt_overwrite=True)
-        if subscription_id is None:
-            self.add_item_to_azureml_config('subscription_id', __class__.get_env_var('AZURE_SUBSCRIPTION_ID', const.DEFAULT_SUBSCRIPTION_ID), prompt_overwrite=True)
-
     def initialize_azureml_config(self, workspace, resource_group, subscription_id, vm_name, vm_size, ssh_user, ssh_public_key_file, ssh_private_key_file):
-        self.set_ml_env_vars(resource_group, subscription_id)
+        log.info(f'got args {workspace, resource_group, subscription_id, vm_name, vm_size, ssh_user, ssh_public_key_file, ssh_private_key_file}', verbose=True)
+        self.add_item_to_azureml_config('resource_group', resource_group, prompt_overwrite=True)
+        self.add_item_to_azureml_config('subscription_id', subscription_id, prompt_overwrite=True)
         self.add_item_to_azureml_config('workspace', workspace, prompt_overwrite=True)
         self.add_item_to_azureml_config('ssh_user', ssh_user, prompt_overwrite=True)
         self.add_item_to_azureml_config('vm_name', vm_name, allow_none=True, prompt_overwrite=True)
@@ -250,16 +234,16 @@ class Mlvm():
         # save new/existing ssh key file paths in azureml_config
         log.info("Saving the new SSH key file paths in azureml_config")
         self.link_ssh_keypair()
-        return ComputeInstanceSshSettings(ssh_public_access='Enabled', admin_public_key=self.azureml_config['public_key_file'],
+        return ComputeInstanceSshSettings(ssh_public_access='Enabled', admin_public_key=self.azureml_config['ssh_public_key_file'],
                                           admin_user_name=self.azureml_config['ssh_user'], ssh_port=const.SSH_PORT)
 
     def link_ssh_keypair(self):
-        if not os.path.isfile(self.azureml_config['public_key_file']):
-            log.warn(f"Could not find existing public key file {self.azureml_config['public_key_file']}")
-            if log.yn(f"Generate new ssh keypair with private key at {self.azureml_config['private_key_file']} \
-                      and public key at {self.azureml_config['public_key_file']}?"):
+        if not os.path.isfile(self.azureml_config['ssh_public_key_file']):
+            log.warn(f"Could not find existing public key file {self.azureml_config['ssh_public_key_file']}")
+            if log.yn(f"Generate new ssh keypair with private key at {self.azureml_config['ssh_private_key_file']} \
+                      and public key at {self.azureml_config['ssh_public_key_file']}?"):
                 # generate a new ssh keypair if we don't have one
-                # Assumes we don't have one if the specified public_key_file doesn't exist
+                # Assumes we don't have one if the specified ssh_public_key_file doesn't exist
                 self.generate_ssh_keypair()
             else:
                 log.error("Did not link ssh keypair. To link an ssh keypair, please specify the file locations for existing ones, \
@@ -289,7 +273,7 @@ class Mlvm():
             format=crypto.serialization.PrivateFormat.PKCS8,
             encryption_algorithm=crypto.serialization.NoEncryption()
         )
-        with open(self.azureml_config['private_ssh_key_file'], 'wb') as f:
+        with open(self.azureml_config['ssh_private_key_file'], 'wb') as f:
             f.write(private_pem)
 
     def save_public_ssh_key(self, public_key):
@@ -297,12 +281,12 @@ class Mlvm():
             encoding=crypto.serialization.Encoding.PEM,
             format=crypto.serialization.PublicFormat.SubjectPublicKeyInfo
         )
-        with open(self.azureml_config['public_ssh_key_file'], 'wb') as f:
+        with open(self.azureml_config['ssh_public_key_file'], 'wb') as f:
             f.write(public_pem)
 
     def load_public_ssh_key(self):
         log.info("Loading public ssh key", verbose=True)
-        with open(self.azureml_config['public_ssh_key_file'], 'rb') as key_file:
+        with open(self.azureml_config['ssh_public_key_file'], 'rb') as key_file:
             try:
                 return crypto.serialization.load_pem_public_key(key_file.read())
             except ValueError as ex:
